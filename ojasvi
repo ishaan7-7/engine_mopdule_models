@@ -1,0 +1,1674 @@
+This our infer stage notebook:
+cell 1:
+from pyspark.sql import functions as F
+from pyspark.sql.types import *
+
+# Expect REPO_ROOT / INFER_READY to be defined in Cell 3; if not, we define placeholders here.
+try:
+    INFER_READY
+except NameError:
+    from pathlib import Path
+    REPO_ROOT = Path(r"C:\engine_module_pipeline")
+    INFER_READY = REPO_ROOT / r"delta\engine_module_infer_ready"
+
+# Build Parquet path glob over all date partitions
+infer_ready_glob = (INFER_READY / "date=*").as_posix()
+
+
+# Spark expects DateType, matching infer-ready writer (Arrow date32)
+system_cols = [
+    StructField("row_hash",    StringType(),    False),
+    StructField("timestamp",   TimestampType(), True),
+    StructField("source_id",   StringType(),    True),
+    StructField("kafka_key",   StringType(),    True),
+    StructField("offset",      LongType(),      True),
+    StructField("source_file", StringType(),    True),
+    StructField("date",        DateType(),      True),
+]
+
+# features will be loaded in Cell 4; we make an empty placeholder list for schema build here.
+try:
+    features
+except NameError:
+    features = []
+
+feature_fields = [StructField(f, DoubleType(), True) for f in features]
+INFER_READY_SCHEMA = StructType(system_cols + feature_fields)
+
+# Prepare a one-shot streaming DataFrame (we'll start it in Cell 14 after foreach_batch exists)
+src_once = (
+    spark.readStream
+         .schema(INFER_READY_SCHEMA)
+         .option("maxFilesPerTrigger", "1000000")
+         .parquet(infer_ready_glob)
+         .select(["row_hash","timestamp","source_id","kafka_key","offset","source_file","date"] + features)
+) if 'spark' in globals() else None
+
+print("Cell 1 prepared. Backfill trigger is launched in Cell 14.")
+
+cell 2:
+import os, subprocess
+from pathlib import Path
+
+print("JAVA_HOME:", os.environ.get("JAVA_HOME"))
+java_path = Path(os.environ.get("JAVA_HOME",""))/"bin/java.exe"
+print("java exe exists:", java_path, java_path.exists())
+print("PATH[0..2]:", os.environ.get("PATH","").split(os.pathsep)[:3])
+
+try:
+    out = subprocess.run([str(java_path), "-version"], capture_output=True, text=True)
+    print("java -version OK")
+    print(out.stderr or out.stdout)
+except Exception as e:
+    print("java spawn FAILED:", repr(e))
+
+delta_jar = Path(r"C:\engine_module_pipeline\jars\delta-spark_2.12-3.2.0.jar")
+storage_jar = Path(r"C:\engine_module_pipeline\jars\delta-storage-3.2.0.jar")
+print("JARs:", [str(delta_jar), str(storage_jar)])
+print(delta_jar, "exists:", delta_jar.exists())
+print(storage_jar, "exists:", storage_jar.exists())
+cell 3:
+import os, subprocess
+from pathlib import Path
+import pyspark as _ps
+
+REPO_ROOT = Path(r"C:\engine_module_pipeline")
+INFER_READY = REPO_ROOT / r"delta\engine_module_infer_ready"
+INFER_RESULTS_DELTA = REPO_ROOT / r"delta\engine_module_inference_results"
+ALERTS_DELTA        = REPO_ROOT / r"delta\engine_module_alerts"
+LSTM_WIN_DELTA      = REPO_ROOT / r"delta\engine_module_lstm_windows"
+MODEL_META_DELTA    = REPO_ROOT / r"delta\engine_module_model_metadata"
+VEH_HEALTH_DELTA    = REPO_ROOT / r"delta\vehicle_health_summary"
+
+# pyspark distro
+PYSPARK_DIR = Path(_ps.__file__).resolve().parent
+SPARK_HOME  = PYSPARK_DIR
+SPARK_SUBMIT = SPARK_HOME / "bin" / "spark-submit.cmd"
+assert SPARK_SUBMIT.exists(), f"{SPARK_SUBMIT} missing. Reinstall pyspark==3.5.1"
+
+# Java
+JAVA_HOME = os.environ.get("JAVA_HOME", r"C:\jdk-11.0.28+6")
+java_exe  = Path(JAVA_HOME) / "bin" / "java.exe"
+assert java_exe.exists(), f"java.exe not found under JAVA_HOME={JAVA_HOME}"
+os.environ["JAVA_HOME"] = JAVA_HOME
+os.environ["PATH"] = str(java_exe.parent) + os.pathsep + os.environ.get("PATH","")
+
+# Spark env
+os.environ["SPARK_HOME"] = str(SPARK_HOME)
+DELTA_JAR   = REPO_ROOT / r"jars\delta-spark_2.12-3.2.0.jar"
+STORAGE_JAR = REPO_ROOT / r"jars\delta-storage-3.2.0.jar"
+for p in (DELTA_JAR, STORAGE_JAR):
+    assert p.exists(), f"Missing JAR: {p}"
+classpath = f"{DELTA_JAR};{STORAGE_JAR}"
+os.environ["CLASSPATH"] = classpath
+
+from pyspark.sql import SparkSession
+builder = (
+    SparkSession.builder
+    .appName("engine_infer_stream_local_delta")
+    .master("local[2]")
+    .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+    .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+    .config("spark.jars", f"{DELTA_JAR},{STORAGE_JAR}")
+    .config("spark.driver.extraClassPath", classpath)
+    .config("spark.executor.extraClassPath", classpath)
+    .config("spark.sql.shuffle.partitions", "8")
+    .config("spark.driver.memory", "4g")
+)
+spark = builder.getOrCreate()
+spark.sparkContext.setLogLevel("WARN")
+print("Spark version:", spark.version)
+
+# Delta probe
+probe_path = (REPO_ROOT / r"delta\__probe_delta").as_posix()
+import shutil
+shutil.rmtree(Path(probe_path), ignore_errors=True)
+spark.range(1).write.format("delta").mode("overwrite").save(probe_path)
+spark.read.format("delta").load(probe_path).show()
+print("[OK] Delta IO verified.")
+cell 4:
+import json
+from pathlib import Path
+
+ARTIFACTS = REPO_ROOT / "engine_module_artifacts"
+FEATURES_JSON = ARTIFACTS / "features.json"
+assert FEATURES_JSON.exists(), f"Missing {FEATURES_JSON}"
+
+features = json.loads(FEATURES_JSON.read_text(encoding="utf-8"))
+if isinstance(features, dict) and "features" in features:
+    features = features["features"]
+assert isinstance(features, list) and len(features) == 25, "features.json must list exactly 25 canonical features"
+print("Loaded canonical features (25). First 5:", features[:5])
+cell 5:
+from pathlib import Path
+import os
+
+ARTIFACTS_DIR = ARTIFACTS
+assert ARTIFACTS_DIR.exists(), f"Artifacts dir missing: {ARTIFACTS_DIR}"
+
+FEATURES_FNAME = "features.json"
+SCALER_FNAME   = "scaler_robust.joblib"
+DENSE_TS       = "model_dense_best_torchscript.pt"
+DENSE_STATE    = "model_dense_best_state_dict.pt"      # optional
+LSTM_TS        = None                                   # not present
+LSTM_STATE     = "model_lstm_long_best.pt"             # state_dict (rehydration)
+ISO_JOBLIB     = "isolation_forest_combiner_final.joblib"  # (or copy you made)
+COMBINER_META  = "combiner_meta.json"                  # optional
+KDE_PREFIX     = "kde_"
+GMM_PREFIX     = "gmm_"
+
+def _safe_local(name: str|None):
+    if not name: return None
+    p = ARTIFACTS_DIR / name
+    return str(p) if p.exists() else None
+
+ARTS = {
+    "features": _safe_local(FEATURES_FNAME),
+    "scaler":   _safe_local(SCALER_FNAME),
+    "dense_ts": _safe_local(DENSE_TS),
+    "dense_sd": _safe_local(DENSE_STATE),
+    "lstm_ts":  _safe_local(LSTM_TS),
+    "lstm_sd":  _safe_local(LSTM_STATE),
+    "isof":     _safe_local(ISO_JOBLIB),
+    "combiner": _safe_local(COMBINER_META),
+    "kde_dir":  str(ARTIFACTS_DIR),
+    "gmm_dir":  str(ARTIFACTS_DIR),
+    "kde_prefix": KDE_PREFIX,
+    "gmm_prefix": GMM_PREFIX,
+}
+
+missing_required = [k for k in ("features","scaler","dense_ts","lstm_sd","isof") if not ARTS[k]]
+if missing_required:
+    raise FileNotFoundError(f"Required artifacts not found: {missing_required}\nARTS={ARTS}")
+
+SCALER_PATH   = ARTS["scaler"]
+DENSE_TS_PATH = ARTS["dense_ts"]
+DENSE_SD_PATH = ARTS["dense_sd"]
+LSTM_TS_PATH  = ARTS["lstm_ts"]
+LSTM_SD_PATH  = ARTS["lstm_sd"]
+ISOF_PATH     = ARTS["isof"]
+KDE_DIR       = Path(ARTS["kde_dir"])
+GMM_DIR       = Path(ARTS["gmm_dir"])
+KDE_PREFIX    = ARTS["kde_prefix"]
+GMM_PREFIX    = ARTS["gmm_prefix"]
+
+# Distribute single-file artifacts (executors may also fetch via SparkFiles)
+for k in ("features","scaler","dense_ts","dense_sd","lstm_ts","lstm_sd","isof","combiner"):
+    p = ARTS.get(k)
+    if p and os.path.exists(p):
+        try:
+            spark.sparkContext.addFile(p)
+        except Exception as e:
+            print(f"[WARN] addFile failed for {p}: {e}")
+
+print("ARTS manifest:", ARTS)
+cell 6:
+# S-6 — Schemas (same as your Cell 6)
+from pyspark.sql.types import *
+from pathlib import Path
+
+feature_fields = [StructField(f, DoubleType(), True) for f in features]
+INFER_RESULTS_SCHEMA = StructType([
+    StructField("row_hash", StringType(), False),
+    StructField("timestamp", TimestampType(), True),
+    StructField("date", StringType(), False),  # string in results (as you designed)
+    StructField("source_id", StringType(), True),
+    StructField("kafka_key", StringType(), True),
+    StructField("offset", LongType(), True),
+    StructField("source_file", StringType(), True),
+    *feature_fields,
+    StructField("recon_error_dense", DoubleType(), True),
+    StructField("dense_per_feature_error", MapType(StringType(), DoubleType()), True),
+    StructField("recon_error_lstm", DoubleType(), True),
+    StructField("lstm_window_id", StringType(), True),
+    StructField("isolation_score", DoubleType(), True),
+    StructField("kde_logp", DoubleType(), True),
+    StructField("gmm_logp", DoubleType(), True),
+    StructField("combiner_score", DoubleType(), True),
+    StructField("composite_score", DoubleType(), True),
+    StructField("anomaly_label", StringType(), True),
+    StructField("anomaly_severity", IntegerType(), True),
+    StructField("model_versions", MapType(StringType(), StringType()), True),
+    StructField("inference_run_id", StringType(), True),
+    StructField("inference_ts", TimestampType(), True),
+    StructField("processing_latency_ms", LongType(), True),
+    StructField("explain_top_k", ArrayType(StructType([
+        StructField("feature", StringType(), False),
+        StructField("contribution", DoubleType(), False),
+    ])), True),
+    StructField("raw_model_outputs", MapType(StringType(), DoubleType()), True),
+    StructField("notes", StringType(), True),
+])
+
+ALERTS_SCHEMA = StructType([
+    StructField("alert_id", StringType(), False),
+    StructField("alert_ts", TimestampType(), False),
+    StructField("row_hash", StringType(), True),
+    StructField("vehicle_id", StringType(), True),
+    StructField("alert_type", StringType(), True),
+    StructField("severity", IntegerType(), True),
+    StructField("composite_score", DoubleType(), True),
+    StructField("triggering_models", ArrayType(StringType()), True),
+    StructField("reason", StringType(), True),
+    StructField("top_features", ArrayType(StringType()), True),
+    StructField("model_versions", MapType(StringType(), StringType()), True),
+    StructField("inference_run_id", StringType(), True),
+    StructField("acked", BooleanType(), True),
+    StructField("acked_by", StringType(), True),
+    StructField("acked_ts", TimestampType(), True),
+    StructField("notified_channels", ArrayType(StringType()), True),
+    StructField("linked_rows", ArrayType(StringType()), True),
+    StructField("extra", MapType(StringType(), StringType()), True),
+    StructField("date", StringType(), True),
+])
+
+LSTM_WIN_SCHEMA = StructType([
+    StructField("lstm_window_id", StringType(), False),
+    StructField("window_start_ts", TimestampType(), False),
+    StructField("window_end_ts", TimestampType(), False),
+    StructField("row_hashes", ArrayType(StringType()), False),
+    StructField("reconstruction_error", DoubleType(), True),
+    StructField("per_step_errors", ArrayType(DoubleType()), True),
+    StructField("model_version", StringType(), True),
+    StructField("inference_run_id", StringType(), True),
+    StructField("date", StringType(), False),
+])
+
+MODEL_METADATA_SCHEMA = StructType([
+    StructField("inference_run_id", StringType(), False),
+    StructField("timestamp", TimestampType(), False),
+    StructField("model_versions", MapType(StringType(), StringType()), False),
+    StructField("params", MapType(StringType(), StringType()), True),
+    StructField("baseline_stats", MapType(StringType(), StringType()), True),
+    StructField("notes", StringType(), True),
+    StructField("source_commit", StringType(), True),
+    StructField("date", StringType(), False),
+])
+
+VEH_HEALTH_SCHEMA = StructType([
+    StructField("vehicle_id", StringType(), False),
+    StructField("date", StringType(), False),
+    StructField("rows_count", LongType(), True),
+    StructField("anomaly_count", LongType(), True),
+    StructField("anomaly_rate", DoubleType(), True),
+    StructField("median_composite_score", DoubleType(), True),
+    StructField("p95_composite_score", DoubleType(), True),
+    StructField("health_score", DoubleType(), True),
+    StructField("days_since_last_alert", IntegerType(), True),
+    StructField("top_failure_modes", ArrayType(StringType()), True),
+    StructField("trend_flag", StringType(), True),
+    StructField("estimated_rul", DoubleType(), True),
+    StructField("model_versions", MapType(StringType(), StringType()), True),
+    StructField("last_inference_ts", TimestampType(), True),
+])
+
+def ensure_delta_table(path: Path, schema: StructType, partition_cols=None):
+    partition_cols = partition_cols or []
+    if (path / "_delta_log").exists():
+        return
+    empty = spark.createDataFrame([], schema)
+    w = empty.write.format("delta").mode("overwrite")
+    if partition_cols:
+        w = w.partitionBy(*partition_cols)
+    w.save(str(path))
+    print("Initialized Delta table:", path)
+
+ensure_delta_table(INFER_RESULTS_DELTA, INFER_RESULTS_SCHEMA, partition_cols=["date"])
+ensure_delta_table(ALERTS_DELTA,        ALERTS_SCHEMA,        partition_cols=["date"])
+ensure_delta_table(LSTM_WIN_DELTA,      LSTM_WIN_SCHEMA,      partition_cols=["date"])
+ensure_delta_table(MODEL_META_DELTA,    MODEL_METADATA_SCHEMA,partition_cols=["date"])
+ensure_delta_table(VEH_HEALTH_DELTA,    VEH_HEALTH_SCHEMA,    partition_cols=["date"])
+print("All 5 output tables are present with schema.")
+
+cell 7:
+# Loader utils with executor-side caching
+import threading, joblib, torch, numpy as np, pandas as pd, os, glob
+from pyspark import SparkFiles
+from pathlib import Path as _P
+
+req = ["SCALER_PATH","DENSE_TS_PATH","DENSE_SD_PATH","LSTM_TS_PATH","LSTM_SD_PATH","ISOF_PATH","KDE_DIR","GMM_DIR","KDE_PREFIX","GMM_PREFIX"]
+missing = [r for r in req if r not in globals()]
+if missing:
+    raise RuntimeError(f"Run Cell 5 first; missing globals: {missing}")
+
+_executor_cache = {"models":{}, "scaler":None, "kde":{}, "gmm":{}, "versions":{}}
+_cache_lock = threading.Lock()
+
+def _first_existing(*candidates):
+    for p in candidates:
+        if p and os.path.exists(p):
+            return p
+    return None
+
+def _sparkfile_by_basename(local_path: str|None):
+    if not local_path:
+        return None
+    try:
+        base = os.path.basename(local_path)
+        p = SparkFiles.get(base)
+        return p if p and os.path.exists(p) else None
+    except Exception:
+        return None
+
+def load_scaler():
+    with _cache_lock:
+        if _executor_cache["scaler"] is not None:
+            return _executor_cache["scaler"]
+        p = _first_existing(SCALER_PATH, _sparkfile_by_basename(SCALER_PATH))
+        if not p:
+            raise RuntimeError("Scaler artifact not found.")
+        sc = joblib.load(p)
+        _executor_cache["scaler"] = sc
+        return sc
+
+def load_dense():
+    with _cache_lock:
+        if "dense" in _executor_cache["models"]:
+            return _executor_cache["models"]["dense"]
+        p_ts = _first_existing(DENSE_TS_PATH, _sparkfile_by_basename(DENSE_TS_PATH))
+        p_sd = _first_existing(DENSE_SD_PATH, _sparkfile_by_basename(DENSE_SD_PATH))
+        if p_ts:
+            m = torch.jit.load(p_ts, map_location="cpu").eval()
+            _executor_cache["models"]["dense"] = ("ts", m)
+            _executor_cache["versions"]["dense"] = "ts"
+            return _executor_cache["models"]["dense"]
+        if p_sd:
+            m = torch.load(p_sd, map_location="cpu")
+            try: m.eval()
+            except Exception: pass
+            _executor_cache["models"]["dense"] = ("sd", m)
+            _executor_cache["versions"]["dense"] = "sd"
+            return _executor_cache["models"]["dense"]
+        raise RuntimeError("Dense AE artifact not found (TS/SD).")
+
+def load_lstm():
+    with _cache_lock:
+        if "lstm" in _executor_cache["models"]:
+            return _executor_cache["models"]["lstm"]
+        p_ts = _first_existing(LSTM_TS_PATH, _sparkfile_by_basename(LSTM_TS_PATH))
+        p_sd = _first_existing(LSTM_SD_PATH, _sparkfile_by_basename(LSTM_SD_PATH))
+        if p_ts:
+            m = torch.jit.load(p_ts, map_location="cpu").eval()
+            _executor_cache["models"]["lstm"] = ("ts", m)
+            _executor_cache["versions"]["lstm"] = "ts"
+            return _executor_cache["models"]["lstm"]
+        if p_sd:
+            # Forgiving rehydrate: weights for encoder/decoder + init out.*
+            state = torch.load(p_sd, map_location="cpu")
+            import torch.nn as nn
+            class ForgivingLSTMAE(nn.Module):
+                def __init__(self, input_dim=25, enc_hidden=64, dec_hidden=25, enc_layers=1, dec_layers=1):
+                    super().__init__()
+                    self.encoder = nn.LSTM(input_size=input_dim, hidden_size=enc_hidden, num_layers=enc_layers, batch_first=True)
+                    self.decoder = nn.LSTM(input_size=enc_hidden,  hidden_size=dec_hidden, num_layers=dec_layers, batch_first=True)
+                    self.out     = nn.Linear(dec_hidden, input_dim)
+                def forward(self, x):  # x: [B,T,F]
+                    enc_out,_ = self.encoder(x)
+                    dec_out,_ = self.decoder(enc_out)
+                    return self.out(dec_out[:, -1:, :])  # last-step reconstruction (shape [B,1,F])
+            m = ForgivingLSTMAE()
+            m.load_state_dict(state, strict=False)
+            m.eval()
+            _executor_cache["models"]["lstm"] = ("sd", m)
+            _executor_cache["versions"]["lstm"] = "sd"
+            return _executor_cache["models"]["lstm"]
+        _executor_cache["versions"]["lstm"] = "none"
+        return None
+
+def load_isof():
+    with _cache_lock:
+        if "isof" in _executor_cache["models"]:
+            return _executor_cache["models"]["isof"]
+        p = _first_existing(ISOF_PATH, _sparkfile_by_basename(ISOF_PATH))
+        if not p:
+            raise RuntimeError("IsolationForest artifact not found.")
+        m = joblib.load(p)
+        _executor_cache["models"]["isof"] = m
+        _executor_cache["versions"]["isof"] = "joblib"
+        return m
+
+def _scan_models(prefix: str, base_dir: _P):
+    pat = str(base_dir / f"{prefix}*.joblib")
+    out = {}
+    for p in glob.glob(pat):
+        base = os.path.basename(p)
+        feat = base[len(prefix):-7]  # strip prefix + '.joblib'
+        if feat:
+            out[feat] = p
+    return out
+
+_KDE_INDEX = None
+_GMM_INDEX = None
+
+def load_kde_for(feature):
+    global _KDE_INDEX
+    with _cache_lock:
+        if _KDE_INDEX is None:
+            _KDE_INDEX = _scan_models(KDE_PREFIX, _P(KDE_DIR))
+        if feature not in _executor_cache["kde"]:
+            p = _KDE_INDEX.get(feature)
+            if not p or not os.path.exists(p): return None
+            _executor_cache["kde"][feature] = joblib.load(p)
+        return _executor_cache["kde"][feature]
+
+def load_gmm_for(feature):
+    global _GMM_INDEX
+    with _cache_lock:
+        if _GMM_INDEX is None:
+            _GMM_INDEX = _scan_models(GMM_PREFIX, _P(GMM_DIR))
+        if feature not in _executor_cache["gmm"]:
+            p = _GMM_INDEX.get(feature)
+            if not p or not os.path.exists(p): return None
+            _executor_cache["gmm"][feature] = joblib.load(p)
+        return _executor_cache["gmm"][feature]
+
+def model_versions_map():
+    with _cache_lock:
+        return dict(_executor_cache["versions"])
+
+cell 8:
+import math
+
+BASELINES = {
+    "dense_med": 0.05, "dense_mad": 0.05,
+    "lstm_med": 0.05,  "lstm_mad": 0.05,
+    "isof_med": 0.0,   "isof_mad": 0.5,
+    "kde_med": -10.0,  "kde_mad": 3.0,
+    "gmm_med": -10.0,  "gmm_mad": 3.0
+}
+def robust_norm(x, med, mad, invert=False, k=1.4826):
+    if x is None: return 0.0
+    denom = (mad*k) if mad and mad>0 else 1.0
+    z = (x - med)/denom
+    if invert: z = -z
+    return 1/(1+math.exp(-z))
+
+WEIGHTS = {"dense":0.35, "lstm":0.25, "isof":0.20, "kde":0.10, "gmm":0.10}
+
+def composite_from_raw(dense_e, lstm_e, isof_s, kde_lp, gmm_lp):
+    s_dense = robust_norm(dense_e, BASELINES["dense_med"], BASELINES["dense_mad"])
+    s_lstm  = robust_norm(lstm_e,  BASELINES["lstm_med"],  BASELINES["lstm_mad"])
+    s_isof  = robust_norm(isof_s,  BASELINES["isof_med"],  BASELINES["isof_mad"], invert=True)
+    s_kde   = robust_norm(kde_lp,  BASELINES["kde_med"],   BASELINES["kde_mad"],  invert=True)
+    s_gmm   = robust_norm(gmm_lp,  BASELINES["gmm_med"],   BASELINES["gmm_mad"],  invert=True)
+    return (WEIGHTS["dense"]*s_dense +
+            WEIGHTS["lstm"] *s_lstm  +
+            WEIGHTS["isof"] *s_isof  +
+            WEIGHTS["kde"]  *s_kde   +
+            WEIGHTS["gmm"]  *s_gmm)
+
+def label_from_composite(c):
+    if c is None: return "unknown", 0
+    if c < 0.20: return "normal", 0
+    if c < 0.50: return "suspicious", 1
+    if c < 0.75: return "anomaly", 2
+    return "critical", 3
+
+cell 9:
+from typing import Iterator
+import uuid, numpy as np, pandas as pd, torch
+
+LSTM_WINDOW = 10  # causal window; score last step
+
+def infer_partition(pdf_iter: Iterator[pd.DataFrame]) -> Iterator[pd.DataFrame]:
+    scaler = load_scaler()
+    dense_mode, dense = load_dense()
+    lstm_entry = load_lstm()
+    isof = load_isof()
+
+    for pdf in pdf_iter:
+        if pdf.empty:
+            yield pd.DataFrame([], columns=[f.name for f in INFER_RESULTS_SCHEMA])
+            continue
+
+        for f in features:
+            if f not in pdf.columns:
+                pdf[f] = np.nan
+
+        feat_df = pdf[features].astype(float)
+        X = scaler.transform(np.nan_to_num(feat_df.values, copy=False))
+
+        # Dense AE
+        with torch.no_grad():
+            xt = torch.from_numpy(X.astype("float32"))
+            recon = dense(xt).numpy() if dense_mode=="ts" else dense(xt).detach().numpy()
+        dense_err = ((X - recon)**2).mean(axis=1)
+        dens_resid = np.abs(X - recon)
+
+        # LSTM AE (causal; per-last step)
+        lstm_err = [None]*len(X)
+        lstm_win_ids = [None]*len(X)
+        lstm_windows_rows = []
+        if lstm_entry is not None:
+            lstm_mode, lstm = lstm_entry
+            with torch.no_grad():
+                for i in range(len(X)):
+                    start = max(0, i-(LSTM_WINDOW-1))
+                    window = X[start:i+1]
+                    if window.shape[0] < 2:
+                        continue
+                    w_id = str(uuid.uuid4())
+                    wt = torch.from_numpy(window.astype("float32")).unsqueeze(0)  # [1,T,25]
+                    out = lstm(wt)  # expects last-step reconstruction shape [1,1,25]
+                    last_rec = out.squeeze(0).squeeze(0).numpy()
+                    err = ((window[-1] - last_rec)**2).mean()
+                    lstm_err[i] = float(err)
+                    lstm_win_ids[i] = w_id
+
+                    rows_slice = pdf.iloc[start:i+1]
+                    lstm_windows_rows.append({
+                        "lstm_window_id": w_id,
+                        "window_start_ts": pd.to_datetime(rows_slice["timestamp"].iloc[0], utc=True),
+                        "window_end_ts":   pd.to_datetime(rows_slice["timestamp"].iloc[-1], utc=True),
+                        "row_hashes": rows_slice["row_hash"].astype(str).tolist(),
+                        "reconstruction_error": float(err),
+                        "per_step_errors": [],
+                        "model_version": "ts" if lstm_mode=="ts" else "sd",
+                        "inference_run_id": None,
+                        "date": str(pd.to_datetime(rows_slice["timestamp"].iloc[-1]).date())
+                    })
+
+        # Isolation Forest (decision_function: higher→more normal)
+        try:
+            iso_scores = isof.decision_function(X).tolist()
+        except Exception:
+            iso_scores = [None]*len(X)
+
+        # KDE/GMM feature-wise log-probs (sum)
+        kde_lp, gmm_lp = [], []
+        for r in range(len(X)):
+            s_kde = 0.0; cnt_k = 0
+            s_gmm = 0.0; cnt_g = 0
+            for j, feat in enumerate(features):
+                v = X[r,j]
+                m_k = load_kde_for(feat)
+                if m_k is not None:
+                    try:
+                        s_kde += float(m_k.score_samples(np.array([[v]]))[0]); cnt_k += 1
+                    except Exception:
+                        pass
+                m_g = load_gmm_for(feat)
+                if m_g is not None:
+                    try:
+                        s_gmm += float(m_g.score(np.array([[v]]))[0]); cnt_g += 1
+                    except Exception:
+                        pass
+            kde_lp.append(s_kde if cnt_k>0 else None)
+            gmm_lp.append(s_gmm if cnt_g>0 else None)
+
+        composites, labels, severities, explains = [], [], [], []
+        for i in range(len(X)):
+            comp = composite_from_raw(
+                dense_err[i],
+                lstm_err[i] if lstm_err else None,
+                iso_scores[i] if iso_scores else None,
+                kde_lp[i],
+                gmm_lp[i]
+            )
+            composites.append(comp)
+            lab, sev = label_from_composite(comp)
+            labels.append(lab); severities.append(sev)
+            feats_abs = [(features[j], float(dens_resid[i,j])) for j in range(len(features))]
+            feats_abs.sort(key=lambda x: x[1], reverse=True)
+            explains.append([{"feature":a,"contribution":b} for a,b in feats_abs[:3]])
+
+        now = pd.Timestamp.utcnow()
+        out_rows = []
+        for i, row in pdf.reset_index(drop=True).iterrows():
+            dct = dict(row)
+            dct["date"] = str(pd.to_datetime(row["timestamp"]).date())
+            dct["recon_error_dense"] = float(dense_err[i])
+            dct["dense_per_feature_error"] = {features[j]: float(dens_resid[i,j]) for j in range(len(features))}
+            dct["recon_error_lstm"] = float(lstm_err[i]) if lstm_err[i] is not None else None
+            dct["lstm_window_id"] = lstm_win_ids[i]
+            dct["isolation_score"] = float(iso_scores[i]) if iso_scores[i] is not None else None
+            dct["kde_logp"] = kde_lp[i]
+            dct["gmm_logp"] = gmm_lp[i]
+            dct["combiner_score"] = None
+            dct["composite_score"] = composites[i]
+            dct["anomaly_label"] = labels[i]
+            dct["anomaly_severity"] = severities[i]
+            dct["model_versions"] = model_versions_map()
+            dct["inference_run_id"] = None
+            dct["inference_ts"] = now
+            dct["processing_latency_ms"] = None
+            dct["explain_top_k"] = explains[i]
+            dct["raw_model_outputs"] = {}
+            dct["notes"] = None
+            out_rows.append(dct)
+
+        df_out = pd.DataFrame(out_rows)
+        df_lstm = pd.DataFrame(lstm_windows_rows) if lstm_windows_rows else pd.DataFrame(
+            [], columns=[f.name for f in LSTM_WIN_SCHEMA]
+        )
+        yield df_out.assign(__lstm_windows__=pd.Series([df_lstm]*len(df_out)))
+
+cell 10:
+# S-10 — foreach_batch (safe, name-cast only, complex-safe)
+from delta.tables import DeltaTable
+from pyspark.sql import functions as F
+from pyspark.sql import DataFrame
+from pyspark.sql.types import (
+    StringType, TimestampType, LongType, IntegerType, DoubleType, DateType,
+    MapType, ArrayType, StructType, StructField
+)
+import pandas as pd, numpy as np, uuid, time
+from pathlib import Path
+import os
+
+ALERT_THRESHOLD = 0.75  # unchanged
+
+# ---------- helpers ----------
+def _is_simple(dt) -> bool:
+    return isinstance(dt, (StringType, TimestampType, LongType, IntegerType, DoubleType, DateType))
+
+def _to_int_or_none_series(s: pd.Series) -> pd.Series:
+    tmp = pd.to_numeric(s, errors="coerce").astype("Int64")
+    return tmp.where(~tmp.isna(), None)
+
+def _norm_map_float(m):
+    if not isinstance(m, dict): return {}
+    out = {}
+    for k, v in m.items():
+        try:
+            out[str(k)] = None if v is None else float(v)
+        except Exception:
+            out[str(k)] = None
+    return out
+
+def _norm_explain_top_k(v):
+    if v is None or (isinstance(v, float) and np.isnan(v)): return []
+    if isinstance(v, list):
+        out = []
+        for d in v:
+            if isinstance(d, dict):
+                f = "" if d.get("feature") is None else str(d.get("feature"))
+                try:
+                    c = 0.0 if d.get("contribution") is None else float(d.get("contribution"))
+                except Exception:
+                    c = 0.0
+                out.append({"feature": f, "contribution": c})
+        return out
+    return []
+
+def _norm_list_str(v):
+    if v is None or (isinstance(v, float) and np.isnan(v)): return []
+    if isinstance(v, list): return [str(x) for x in v]
+    if isinstance(v, tuple): return [str(x) for x in v]
+    return []
+
+def _norm_versions(m):
+    if not isinstance(m, dict): return {}
+    return {str(k): ("" if v is None else str(v)) for k, v in m.items()}
+
+def _select_cast_by_name(df, target_schema: StructType):
+    sel = []
+    for field in target_schema:
+        cname = field.name
+        col = F.col(f"`{cname}`")
+        if _is_simple(field.dataType):
+            col = col.cast(field.dataType)
+        sel.append(col.alias(cname))
+    return df.select(*sel)
+
+def _sanitize_df_out(df_out: pd.DataFrame, target_schema: StructType) -> pd.DataFrame:
+    schema_cols = [f.name for f in target_schema]
+
+    # 1) Drop extras; add missing
+    for c in list(df_out.columns):
+        if c not in schema_cols:
+            df_out.drop(columns=[c], inplace=True)
+    for c in schema_cols:
+        if c not in df_out.columns:
+            df_out[c] = None
+
+    # 2) Scalars
+    if "offset" in df_out.columns:
+        df_out["offset"] = _to_int_or_none_series(df_out["offset"])
+    if "processing_latency_ms" in df_out.columns:
+        df_out["processing_latency_ms"] = _to_int_or_none_series(df_out["processing_latency_ms"])
+    if "anomaly_severity" in df_out.columns:
+        df_out["anomaly_severity"] = pd.to_numeric(df_out["anomaly_severity"], errors="coerce").fillna(0).astype(int)
+
+    # 3) Dates & timestamps
+    if "date" in df_out.columns:
+        df_out["date"] = df_out["date"].astype(str)  # contract: string in results
+    # inference_ts left as pandas ts (Spark will infer)
+
+    # 4) Complex types
+    if "explain_top_k" in df_out.columns:
+        df_out["explain_top_k"] = df_out["explain_top_k"].apply(_norm_explain_top_k)
+    if "dense_per_feature_error" in df_out.columns:
+        df_out["dense_per_feature_error"] = df_out["dense_per_feature_error"].apply(_norm_map_float)
+    if "raw_model_outputs" in df_out.columns:
+        df_out["raw_model_outputs"] = df_out["raw_model_outputs"].apply(_norm_map_float)
+    if "model_versions" in df_out.columns:
+        df_out["model_versions"] = df_out["model_versions"].apply(_norm_versions)
+
+    # 5) Reindex to schema order
+    return df_out.reindex(columns=schema_cols, copy=False)
+
+def _sanitize_alerts(alerts_pdf: pd.DataFrame) -> pd.DataFrame:
+    if alerts_pdf.empty: return alerts_pdf
+    alerts_pdf["triggering_models"]   = alerts_pdf.get("triggering_models", pd.Series([[]]*len(alerts_pdf))).apply(_norm_list_str)
+    alerts_pdf["top_features"]        = alerts_pdf.get("top_features", pd.Series([[]]*len(alerts_pdf))).apply(_norm_list_str)
+    alerts_pdf["notified_channels"]   = alerts_pdf.get("notified_channels", pd.Series([[]]*len(alerts_pdf))).apply(_norm_list_str)
+    alerts_pdf["linked_rows"]         = alerts_pdf.get("linked_rows", pd.Series([[]]*len(alerts_pdf))).apply(_norm_list_str)
+    alerts_pdf["extra"]               = alerts_pdf.get("extra", pd.Series([{}]*len(alerts_pdf))).apply(lambda m: m if isinstance(m, dict) else {})
+    if "model_versions" in alerts_pdf.columns:
+        alerts_pdf["model_versions"] = alerts_pdf["model_versions"].apply(_norm_versions)
+    alerts_pdf["acked"] = alerts_pdf.get("acked", pd.Series([False]*len(alerts_pdf))).fillna(False).astype(bool)
+    alerts_pdf["date"]  = alerts_pdf["date"].astype(str)
+    return alerts_pdf
+
+# ---------- foreach_batch ----------
+def foreach_batch(batch_df: DataFrame, batch_id: int):
+    t0 = time.time()
+
+    # Strict input projection by name
+    expected_in_cols = ["row_hash","timestamp","source_id","kafka_key","offset","source_file","date"] + features
+    src_cols = [c for c in expected_in_cols if c in batch_df.columns]
+    pdf = batch_df.select(*src_cols).toPandas()
+    if pdf.empty:
+        print(f"[fb] ▶ batch_id={batch_id} empty; skip.")
+        return
+
+    # Run partition inference (returns df_out with __lstm_windows__ bundle)
+    outs = list(infer_partition([pdf]))
+    df_out = outs[0]
+
+    # Unpack LSTM windows
+    lstm_frames = []
+    if "__lstm_windows__" in df_out.columns:
+        for x in df_out["__lstm_windows__"].tolist():
+            if isinstance(x, pd.DataFrame) and not x.empty:
+                lstm_frames.append(x)
+        df_out = df_out.drop(columns=["__lstm_windows__"])
+    df_lstm = (pd.concat(lstm_frames, ignore_index=True)
+               if lstm_frames else pd.DataFrame([], columns=[f.name for f in LSTM_WIN_SCHEMA]))
+
+    # Fill minimal fields & sanitize
+    run_id = f"run-{uuid.uuid4().hex}"
+    now_ts = pd.Timestamp.utcnow()
+    df_out["inference_run_id"] = run_id
+    if "inference_ts" not in df_out.columns or df_out["inference_ts"].isna().all():
+        df_out["inference_ts"] = now_ts
+    df_out["date"] = pd.to_datetime(df_out["timestamp"], errors="coerce").dt.date.astype(str)
+
+    # Normalize complex/scalar fields for results
+    df_out = _sanitize_df_out(df_out, INFER_RESULTS_SCHEMA)
+
+    # Create Spark DF WITHOUT schema, then name-cast/select
+    out_spark_tmp = spark.createDataFrame(df_out)
+    out_spark = _select_cast_by_name(out_spark_tmp, INFER_RESULTS_SCHEMA)
+
+    # MERGE results
+    tgt = DeltaTable.forPath(spark, str(INFER_RESULTS_DELTA))
+    schema_cols = [f.name for f in INFER_RESULTS_SCHEMA]
+    (tgt.alias("t")
+        .merge(out_spark.alias("s"), "t.row_hash = s.row_hash")
+        .whenMatchedUpdate(condition="s.inference_ts > t.inference_ts",
+                           set={c: f"s.`{c}`" for c in schema_cols})
+        .whenNotMatchedInsert(values={c: f"s.`{c}`" for c in schema_cols})
+        .execute())
+
+    # LSTM windows append (ensure shapes)
+    if not df_lstm.empty:
+        if "date" not in df_lstm.columns:
+            df_lstm["date"] = pd.to_datetime(df_lstm["window_end_ts"], errors="coerce", utc=True).dt.tz_convert(None).dt.date.astype(str)
+        df_lstm["inference_run_id"] = run_id
+        # Normalize arrays
+        if "row_hashes" in df_lstm.columns:
+            df_lstm["row_hashes"] = df_lstm["row_hashes"].apply(_norm_list_str)
+        if "per_step_errors" in df_lstm.columns:
+            def _norm_list_float(v):
+                if v is None or (isinstance(v, float) and np.isnan(v)): return []
+                if isinstance(v, list): return [float(x) for x in v]
+                if isinstance(v, tuple): return [float(x) for x in v]
+                return []
+            df_lstm["per_step_errors"] = df_lstm["per_step_errors"].apply(_norm_list_float)
+
+        lstm_spark_tmp = spark.createDataFrame(df_lstm)
+        lstm_spark = lstm_spark_tmp.select(
+            *[
+                (F.col(f"`{f.name}`").cast(f.dataType) if _is_simple(f.dataType) else F.col(f"`{f.name}`")).alias(f.name)
+                for f in LSTM_WIN_SCHEMA
+            ]
+        )
+        lstm_spark.write.format("delta").mode("append").save(str(LSTM_WIN_DELTA))
+
+    # Alerts
+    alerts_pdf = df_out.loc[pd.Series(df_out["composite_score"]).fillna(0) >= ALERT_THRESHOLD].copy()
+    if not alerts_pdf.empty:
+        alerts_pdf["alert_id"] = [str(uuid.uuid4()) for _ in range(len(alerts_pdf))]
+        alerts_pdf["alert_ts"] = pd.to_datetime(alerts_pdf["inference_ts"], utc=True)
+        alerts_pdf["vehicle_id"] = alerts_pdf["source_id"].astype(str)
+        alerts_pdf["alert_type"] = "composite_high"
+        alerts_pdf["severity"] = alerts_pdf["anomaly_severity"]
+        alerts_pdf["triggering_models"] = [["dense","lstm","isof","kde","gmm"]] * len(alerts_pdf)
+
+        def _top_feats(arr):
+            if not isinstance(arr, list): return []
+            return [str(d.get("feature")) for d in arr if isinstance(d, dict) and d.get("feature") is not None]
+        alerts_pdf["top_features"] = alerts_pdf["explain_top_k"].apply(_top_feats)
+
+        alerts_pdf["linked_rows"] = alerts_pdf.apply(lambda r: [str(r["row_hash"])], axis=1)
+        alerts_pdf["acked"] = False
+        alerts_pdf["acked_by"] = None
+        alerts_pdf["acked_ts"] = None
+        alerts_pdf["date"] = alerts_pdf["date"].astype(str)
+
+        alerts_pdf = _sanitize_alerts(alerts_pdf)
+
+        alerts_spark_tmp = spark.createDataFrame(alerts_pdf)
+        alerts_spark = alerts_spark_tmp.select(
+            *[
+                (F.col(f"`{f.name}`").cast(f.dataType) if _is_simple(f.dataType) else F.col(f"`{f.name}`")).alias(f.name)
+                for f in ALERTS_SCHEMA
+            ]
+        )
+        alerts_spark.write.format("delta").mode("append").save(str(ALERTS_DELTA))
+
+    # Metadata
+    meta_pdf = pd.DataFrame([{
+        "inference_run_id": run_id,
+        "timestamp": pd.Timestamp.utcnow(),
+        "model_versions": df_out["model_versions"].iloc[0] if "model_versions" in df_out.columns else {},
+        "params": {"LSTM_WINDOW": str(LSTM_WINDOW)},
+        "baseline_stats": {k: str(v) for k, v in BASELINES.items()},
+        "notes": None,
+        "source_commit": None,
+        "date": str(pd.Timestamp.utcnow().date()),
+    }])
+    meta_spark_tmp = spark.createDataFrame(meta_pdf)
+    meta_spark = meta_spark_tmp.select(
+        *[
+            (F.col(f"`{f.name}`").cast(f.dataType) if _is_simple(f.dataType) else F.col(f"`{f.name}`")).alias(f.name)
+            for f in MODEL_METADATA_SCHEMA
+        ]
+    )
+    meta_spark.write.format("delta").mode("append").save(str(MODEL_META_DELTA))
+
+    # Vehicle health (merge by vehicle_id+date)
+    veh_pdf = df_out.groupby(["source_id", "date"], dropna=False).agg(
+        rows_count=("row_hash", "count"),
+        anomaly_count=("anomaly_severity", lambda s: int((pd.Series(s).fillna(0) >= 2).sum())),
+        median_composite_score=("composite_score", "median"),
+        p95_composite_score=("composite_score", lambda s: float(pd.Series(s).quantile(0.95))),
+        last_inference_ts=("inference_ts", "max")
+    ).reset_index().rename(columns={"source_id": "vehicle_id"})
+    veh_pdf["anomaly_rate"] = veh_pdf.apply(
+        lambda r: (r["anomaly_count"] / r["rows_count"]) if r["rows_count"] else 0.0, axis=1
+    )
+    def _health(r):
+        alpha, beta, gamma = 0.6, 0.3, 0.1
+        recency = 1.0
+        raw = 1 - (alpha * float(r["median_composite_score"]) + beta * float(r["anomaly_rate"]) + gamma * (1 - recency))
+        return max(0.0, min(100.0, raw * 100))
+    veh_pdf["health_score"] = veh_pdf.apply(_health, axis=1)
+    veh_pdf["days_since_last_alert"] = None
+    veh_pdf["top_failure_modes"] = [[] for _ in range(len(veh_pdf))]
+    veh_pdf["trend_flag"] = "steady"
+    veh_pdf["estimated_rul"] = None
+    veh_pdf["model_versions"] = [df_out["model_versions"].iloc[0] for _ in range(len(veh_pdf))]
+
+    veh_spark_tmp = spark.createDataFrame(veh_pdf)
+    veh_spark = veh_spark_tmp.select(
+        *[
+            (F.col(f"`{f.name}`").cast(f.dataType) if _is_simple(f.dataType) else F.col(f"`{f.name}`")).alias(f.name)
+            for f in VEH_HEALTH_SCHEMA
+        ]
+    )
+    tgt_h = DeltaTable.forPath(spark, str(VEH_HEALTH_DELTA))
+    (tgt_h.alias("t")
+         .merge(veh_spark.alias("s"),
+                "t.vehicle_id = s.vehicle_id AND t.date = s.date")
+         .whenMatchedUpdate(
+             condition="s.last_inference_ts > t.last_inference_ts",
+             set={c: f"s.`{c}`" for c in veh_spark.columns}
+          )
+         .whenNotMatchedInsert(values={c: f"s.`{c}`" for c in veh_spark.columns})
+         .execute())
+
+    took = int((time.time() - t0) * 1000)
+    print(f"[fb] ✓ batch_id={batch_id} rows_in={len(pdf)} rows_scored={len(df_out)} ms={took}")
+
+# Optional: small timed wrapper that DOES NOT change logic or casting
+_DEBUG_HEAD = int(os.environ.get("INFER_DEBUG_ROWS", "0"))
+def foreach_batch_timed(batch_df: DataFrame, batch_id: int):
+    if _DEBUG_HEAD:
+        batch_df = batch_df.limit(_DEBUG_HEAD)
+        print(f"[fb] DEBUG cap: {_DEBUG_HEAD} rows")
+    return foreach_batch(batch_df, batch_id)
+print("🔧 foreach_batch installed (safe name-cast path).")
+
+cell 11:
+# S-11 — Streaming source (unchanged)
+from pyspark.sql import functions as F
+from pyspark.sql.types import *
+
+spark.conf.set("spark.sql.parquet.enableVectorizedReader", "false")
+
+system_cols = [
+    StructField("row_hash",    StringType(),    False),
+    StructField("timestamp",   TimestampType(), True),
+    StructField("source_id",   StringType(),    True),
+    StructField("kafka_key",   StringType(),    True),
+    StructField("offset",      LongType(),      True),
+    StructField("source_file", StringType(),    True),
+    StructField("date",        DateType(),      True),
+]
+feature_fields = [StructField(f, DoubleType(), True) for f in features]
+INFER_READY_SCHEMA = StructType(system_cols + feature_fields)
+
+infer_ready_glob = (INFER_READY / "date=*").as_posix()
+
+src = (
+    spark.readStream
+         .schema(INFER_READY_SCHEMA)
+         .option("maxFilesPerTrigger", "50")
+         .parquet(infer_ready_glob)
+)
+print("✅ Streaming Parquet source ready — use `src` with writeStream.foreachBatch(foreach_batch_timed).")
+
+cell 12:
+import threading, http.server
+
+METRICS_PORT = 9109
+_metrics = {"batches":0, "rows":0}
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != "/metrics":
+            self.send_response(404); self.end_headers(); return
+        self.send_response(200); self.end_headers()
+        out = "\n".join([
+            f'engine_inference_batches_total {_metrics["batches"]}',
+            f'engine_inference_rows_total {_metrics["rows"]}',
+        ])
+        self.wfile.write(out.encode("utf-8"))
+    def log_message(self, *args, **kwargs): pass
+
+def run_metrics():
+    with http.server.ThreadingHTTPServer(("", METRICS_PORT), Handler) as httpd:
+        print(f"Prometheus metrics on :{METRICS_PORT}/metrics")
+        httpd.serve_forever()
+
+t = threading.Thread(target=run_metrics, daemon=True)
+t.start()
+
+cell 13:
+assert 'spark' in globals(), "SparkSession missing."
+assert 'features' in globals(), "Run feature loader."
+assert 'INFER_RESULTS_SCHEMA' in globals(), "Run schema init."
+
+# (Optional) prewarm executors
+try:
+    _ = spark.sparkContext.parallelize([0], 1).map(lambda x: x).collect()
+    print("Executors reachable. (Light prewarm done)")
+except Exception as e:
+    print("Prewarm skip:", e)
+
+print("✅ Rebind complete. Proceed to backfill (Cell 14) or start a continuous stream with `src` + foreachBatch.")
+
+cell 14:
+# 14A — Batch read infer-ready, run inference once, prepare normalized pandas frames
+import pandas as pd, numpy as np, uuid, time
+from pyspark.sql.types import *
+from pyspark.sql import functions as F
+
+# Preconditions
+assert 'spark' in globals(), "SparkSession missing."
+assert isinstance(features, list) and len(features)==25, "features (25) not loaded."
+assert 'infer_partition' in globals(), "infer_partition() missing (Cell S-9)."
+
+# Rebuild input schema (same as Cell 11)
+_system_cols = [
+    StructField("row_hash",    StringType(),    False),
+    StructField("timestamp",   TimestampType(), True),
+    StructField("source_id",   StringType(),    True),
+    StructField("kafka_key",   StringType(),    True),
+    StructField("offset",      LongType(),      True),
+    StructField("source_file", StringType(),    True),
+    StructField("date",        DateType(),      True),
+]
+_feature_fields = [StructField(f, DoubleType(), True) for f in features]
+INFER_READY_SCHEMA = StructType(_system_cols + _feature_fields)
+
+infer_ready_glob = (INFER_READY / "date=*").as_posix()
+_sel_cols = ["row_hash","timestamp","source_id","kafka_key","offset","source_file","date"] + features
+
+# ---------- helpers (same logic as S-10, inlined) ----------
+def _to_int_or_none_series(s: pd.Series) -> pd.Series:
+    tmp = pd.to_numeric(s, errors="coerce")
+    # convert to Python objects: NaN -> None, else int
+    return tmp.apply(lambda x: int(x) if pd.notna(x) else None)
+
+def _norm_map_float(m):
+    if not isinstance(m, dict): return {}
+    out = {}
+    for k,v in m.items():
+        try: out[str(k)] = None if v is None else float(v)
+        except Exception: out[str(k)] = None
+    return out
+
+def _norm_versions(m):
+    if not isinstance(m, dict): return {}
+    return {str(k): ("" if v is None else str(v)) for k,v in m.items()}
+
+def _norm_explain_top_k(v):
+    if v is None or (isinstance(v,float) and np.isnan(v)): return []
+    if isinstance(v, list):
+        out=[]
+        for d in v:
+            if isinstance(d, dict):
+                f = "" if d.get("feature") is None else str(d.get("feature"))
+                try: c = 0.0 if d.get("contribution") is None else float(d.get("contribution"))
+                except Exception: c = 0.0
+                out.append({"feature": f, "contribution": c})
+        return out
+    return []
+
+def _norm_list_str(v):
+    if v is None or (isinstance(v,float) and np.isnan(v)): return []
+    if isinstance(v, list): return [str(x) for x in v]
+    if isinstance(v, tuple): return [str(x) for x in v]
+    return []
+
+def _norm_list_float(v):
+    if v is None or (isinstance(v,float) and np.isnan(v)): return []
+    if isinstance(v, list): return [float(x) for x in v]
+    if isinstance(v, tuple): return [float(x) for x in v]
+    return []
+
+# ---------- 1) Read batch ----------
+df_batch = (
+    spark.read
+         .schema(INFER_READY_SCHEMA)
+         .parquet(infer_ready_glob)
+         .select(*_sel_cols)
+)
+total_rows = df_batch.count()
+print(f"[14A] Batch rows visible: {total_rows}")
+
+if total_rows == 0:
+    # Prepare empty placeholders so later cells no-op politely
+    df_out_pdf = pd.DataFrame(columns=[f.name for f in INFER_RESULTS_SCHEMA])
+    df_lstm_pdf = pd.DataFrame(columns=[f.name for f in LSTM_WIN_SCHEMA])
+    alerts_pdf  = pd.DataFrame(columns=[f.name for f in ALERTS_SCHEMA])
+    veh_pdf     = pd.DataFrame(columns=[f.name for f in VEH_HEALTH_SCHEMA])
+    meta_pdf    = pd.DataFrame(columns=[f.name for f in MODEL_METADATA_SCHEMA])
+    print("[14A] Nothing to process.")
+else:
+    pdf = df_batch.toPandas()
+
+    # ---------- 2) Run inference once ----------
+    outs = list(infer_partition([pdf]))
+    df_out_pdf = outs[0]
+
+    # Unpack LSTM windows bundle
+    lstm_frames = []
+    if "__lstm_windows__" in df_out_pdf.columns:
+        for x in df_out_pdf["__lstm_windows__"].tolist():
+            if isinstance(x, pd.DataFrame) and not x.empty:
+                lstm_frames.append(x)
+    # All frames are identical (attached to each row). Take the first one.
+        if lstm_frames:
+            df_lstm_pdf = lstm_frames[0].copy()
+        else:
+            df_lstm_pdf = pd.DataFrame(columns=[f.name for f in LSTM_WIN_SCHEMA])
+        df_out_pdf = df_out_pdf.drop(columns=["__lstm_windows__"])
+    else:
+        df_lstm_pdf = pd.DataFrame(columns=[f.name for f in LSTM_WIN_SCHEMA])
+
+    if not df_lstm_pdf.empty and "lstm_window_id" in df_lstm_pdf.columns:
+        before = len(df_lstm_pdf)
+        df_lstm_pdf = df_lstm_pdf.drop_duplicates(subset=["lstm_window_id"], keep="first")
+        after = len(df_lstm_pdf)
+        print(f"[14A] LSTM windows deduped by id: {before} → {after}")
+
+    # ---------- 3) Fill required fields & normalize (results) ----------
+    run_id = f"run-{uuid.uuid4().hex}"
+    now_ts = pd.Timestamp.utcnow()
+    df_out_pdf["inference_run_id"] = run_id
+    if "inference_ts" not in df_out_pdf.columns or df_out_pdf["inference_ts"].isna().all():
+        df_out_pdf["inference_ts"] = now_ts
+    df_out_pdf["date"] = pd.to_datetime(df_out_pdf["timestamp"], errors="coerce").dt.date.astype(str)
+
+    # Critical: ensure LongType cols are None, not NaN
+    if "offset" in df_out_pdf.columns:
+        df_out_pdf["offset"] = _to_int_or_none_series(df_out_pdf["offset"])
+    if "processing_latency_ms" in df_out_pdf.columns:
+        df_out_pdf["processing_latency_ms"] = _to_int_or_none_series(df_out_pdf["processing_latency_ms"])
+
+    # normalize complex
+    if "dense_per_feature_error" in df_out_pdf.columns:
+        df_out_pdf["dense_per_feature_error"] = df_out_pdf["dense_per_feature_error"].apply(_norm_map_float)
+    if "raw_model_outputs" in df_out_pdf.columns:
+        df_out_pdf["raw_model_outputs"] = df_out_pdf["raw_model_outputs"].apply(_norm_map_float)
+    if "model_versions" in df_out_pdf.columns:
+        df_out_pdf["model_versions"] = df_out_pdf["model_versions"].apply(_norm_versions)
+    if "explain_top_k" in df_out_pdf.columns:
+        df_out_pdf["explain_top_k"] = df_out_pdf["explain_top_k"].apply(_norm_explain_top_k)
+    if "anomaly_severity" in df_out_pdf.columns:
+        df_out_pdf["anomaly_severity"] = pd.to_numeric(df_out_pdf["anomaly_severity"], errors="coerce").fillna(0).astype(int)
+
+    # ---------- 4) Build alerts (normalized) ----------
+    ALERT_THRESHOLD = 0.75
+    alerts_pdf = df_out_pdf.loc[pd.Series(df_out_pdf["composite_score"]).fillna(0) >= ALERT_THRESHOLD].copy()
+    if not alerts_pdf.empty:
+        alerts_pdf["alert_id"] = [str(uuid.uuid4()) for _ in range(len(alerts_pdf))]
+        alerts_pdf["alert_ts"] = pd.to_datetime(alerts_pdf["inference_ts"], utc=True)
+        alerts_pdf["vehicle_id"] = alerts_pdf["source_id"].astype(str)
+        alerts_pdf["alert_type"] = "composite_high"
+        alerts_pdf["severity"] = alerts_pdf["anomaly_severity"]
+        alerts_pdf["triggering_models"] = [["dense","lstm","isof","kde","gmm"]] * len(alerts_pdf)
+        def _top_feats(arr):
+            if not isinstance(arr, list): return []
+            return [str(d.get("feature")) for d in arr if isinstance(d, dict) and d.get("feature") is not None]
+        alerts_pdf["top_features"] = alerts_pdf["explain_top_k"].apply(_top_feats)
+        alerts_pdf["linked_rows"] = alerts_pdf.apply(lambda r: [str(r["row_hash"])], axis=1)
+        alerts_pdf["acked"] = False
+        alerts_pdf["acked_by"] = None
+        alerts_pdf["acked_ts"] = None
+        alerts_pdf["date"] = alerts_pdf["date"].astype(str)
+        # normalize arrays/maps again
+        alerts_pdf["triggering_models"] = alerts_pdf["triggering_models"].apply(_norm_list_str)
+        alerts_pdf["top_features"] = alerts_pdf["top_features"].apply(_norm_list_str)
+        alerts_pdf["linked_rows"] = alerts_pdf["linked_rows"].apply(_norm_list_str)
+        alerts_pdf["notified_channels"] = [[] for _ in range(len(alerts_pdf))]
+        alerts_pdf["extra"] = [{} for _ in range(len(alerts_pdf))]
+        alerts_pdf["model_versions"] = alerts_pdf["model_versions"].apply(_norm_versions) if "model_versions" in alerts_pdf else [{}]*len(alerts_pdf)
+
+    # ---------- 5) Normalize LSTM windows ----------
+    if not df_lstm_pdf.empty:
+        if "date" not in df_lstm_pdf.columns:
+            df_lstm_pdf["date"] = pd.to_datetime(df_lstm_pdf["window_end_ts"], errors="coerce", utc=True).dt.tz_convert(None).dt.date.astype(str)
+        df_lstm_pdf["inference_run_id"] = run_id
+        if "row_hashes" in df_lstm_pdf.columns:
+            df_lstm_pdf["row_hashes"] = df_lstm_pdf["row_hashes"].apply(_norm_list_str)
+        if "per_step_errors" in df_lstm_pdf.columns:
+            df_lstm_pdf["per_step_errors"] = df_lstm_pdf["per_step_errors"].apply(_norm_list_float)
+
+    # ---------- 6) Vehicle health ----------
+    veh_pdf = df_out_pdf.groupby(["source_id", "date"], dropna=False).agg(
+        rows_count=("row_hash","count"),
+        anomaly_count=("anomaly_severity", lambda s: int((pd.Series(s).fillna(0) >= 2).sum())),
+        median_composite_score=("composite_score", "median"),
+        p95_composite_score=("composite_score", lambda s: float(pd.Series(s).quantile(0.95))),
+        last_inference_ts=("inference_ts","max")
+    ).reset_index().rename(columns={"source_id":"vehicle_id"})
+    veh_pdf["anomaly_rate"] = veh_pdf.apply(
+        lambda r: (r["anomaly_count"]/r["rows_count"]) if r["rows_count"] else 0.0, axis=1)
+    def _health(r):
+        alpha,beta,gamma = 0.6,0.3,0.1
+        recency = 1.0
+        raw = 1 - (alpha*float(r["median_composite_score"]) + beta*float(r["anomaly_rate"]) + gamma*(1-recency))
+        return max(0.0, min(100.0, raw*100))
+    veh_pdf["health_score"] = veh_pdf.apply(_health, axis=1)
+    veh_pdf["days_since_last_alert"] = None
+    veh_pdf["top_failure_modes"] = [[] for _ in range(len(veh_pdf))]
+    veh_pdf["trend_flag"] = "steady"
+    veh_pdf["estimated_rul"] = None
+    veh_pdf["model_versions"] = [df_out_pdf["model_versions"].iloc[0] if "model_versions" in df_out_pdf.columns else {} for _ in range(len(veh_pdf))]
+
+    # ---------- 7) Model metadata ----------
+    meta_pdf = pd.DataFrame([{
+        "inference_run_id": run_id,
+        "timestamp": pd.Timestamp.utcnow(),
+        "model_versions": df_out_pdf["model_versions"].iloc[0] if "model_versions" in df_out_pdf.columns else {},
+        "params": {"LSTM_WINDOW": str(LSTM_WINDOW)},
+        "baseline_stats": {k: str(v) for k, v in BASELINES.items()},
+        "notes": None,
+        "source_commit": None,
+        "date": str(pd.Timestamp.utcnow().date()),
+    }])
+    print("[14A] Prepared df_out_pdf, df_lstm_pdf, alerts_pdf, veh_pdf, meta_pdf.")
+
+cell 15:
+# 14B — Robust writer (string-staged → cast) for inference_results
+import json
+from delta.tables import DeltaTable
+from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    StringType, TimestampType, LongType, IntegerType, DoubleType, DateType,
+    MapType, ArrayType, StructType, StructField
+)
+import pandas as pd
+import numpy as np
+
+if len(df_out_pdf) == 0:
+    print("[14B] No results to write.")
+else:
+    # --- 0) Column set & order ---
+    tgt_cols = [f.name for f in INFER_RESULTS_SCHEMA]
+    for c in tgt_cols:
+        if c not in df_out_pdf.columns:
+            df_out_pdf[c] = None
+    df_out_pdf = df_out_pdf[tgt_cols]
+
+    # --- 1) JSON-encode complex columns and stringify everything else ---
+    complex_schemas = {
+        "dense_per_feature_error": MapType(StringType(), DoubleType()),
+        "raw_model_outputs":       MapType(StringType(), DoubleType()),
+        "model_versions":          MapType(StringType(), StringType()),
+        "explain_top_k":           ArrayType(StructType([
+                                     StructField("feature", StringType(), False),
+                                     StructField("contribution", DoubleType(), False)
+                                   ])),
+    }
+
+    def _to_json_or_empty(v, empty):
+        try:
+            return json.dumps(v if v is not None else empty)
+        except Exception:
+            return json.dumps(empty)
+
+    def _to_string(v):
+        # None/NaN -> None
+        if v is None: return None
+        if isinstance(v, float) and np.isnan(v): return None
+        # timestamps: make ISO for clean cast later
+        if isinstance(v, pd.Timestamp):
+            try:
+                return v.tz_localize("UTC").isoformat()
+            except Exception:
+                try:
+                    return v.isoformat()
+                except Exception:
+                    return str(v)
+        return str(v)
+
+    df_str = pd.DataFrame()
+    for c in tgt_cols:
+        if c in complex_schemas:
+            # JSON string
+            df_str[c] = df_out_pdf[c].apply(lambda v: _to_json_or_empty(v, {} if c != "explain_top_k" else []))
+        else:
+            df_str[c] = df_out_pdf[c].apply(_to_string)
+
+    # --- 2) Create Spark DF with ALL-STRING schema (no inference anywhere) ---
+    string_schema = StructType([StructField(c, StringType(), True) for c in tgt_cols])
+    tmp_df = spark.createDataFrame(df_str, schema=string_schema)
+
+    # --- 3) Build select list: parse complex JSON, cast simple strings to target types ---
+    def _is_simple(dt):
+        return isinstance(dt, (StringType, TimestampType, LongType, IntegerType, DoubleType, DateType))
+
+    select_exprs = []
+    for f in INFER_RESULTS_SCHEMA:
+        cname = f.name
+        col = F.col(f"`{cname}`")
+        if cname in complex_schemas:
+            col = F.from_json(col, complex_schemas[cname])
+        elif isinstance(f.dataType, TimestampType):
+            # Spark parses ISO-8601 timestamps from strings
+            col = col.cast(TimestampType())
+        elif isinstance(f.dataType, DateType):
+            # dates are already YYYY-MM-DD strings from 14A
+            col = col.cast(DateType())
+        elif _is_simple(f.dataType):
+            # for numeric ints/floats, None strings -> null, numeric strings -> cast
+            col = col.cast(f.dataType)
+        # alias to exact target name
+        select_exprs.append(col.alias(cname))
+
+    results_df = tmp_df.select(*select_exprs)
+
+    # --- 4) MERGE by row_hash; update if newer inference_ts ---
+    tgt = DeltaTable.forPath(spark, str(INFER_RESULTS_DELTA))
+    cols = [f.name for f in INFER_RESULTS_SCHEMA]
+    (tgt.alias("t")
+        .merge(results_df.alias("s"), "t.row_hash = s.row_hash")
+        .whenMatchedUpdate(
+            condition="s.inference_ts > t.inference_ts",
+            set={c: f"s.`{c}`" for c in cols}
+        )
+        .whenNotMatchedInsert(values={c: f"s.`{c}`" for c in cols})
+        .execute())
+
+    wrote = results_df.count()
+    print(f"[14B] inference_results MERGE complete. rows={wrote}")
+
+cell 16:
+# 14C — Robust writer for engine_module_lstm_windows (string-stage → cast + coalesce)
+# Prereqs: df_lstm_pdf prepared in 14A; LSTM_WIN_SCHEMA / LSTM_WIN_DELTA defined.
+
+import json, numpy as np, pandas as pd
+from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    StructType, StructField,
+    StringType, TimestampType, DoubleType, ArrayType
+)
+
+if len(df_lstm_pdf) == 0:
+    print("[14C] No LSTM windows to write.")
+else:
+    # Extra safety: de-duplicate by PK if not already done in 14A
+    if "lstm_window_id" in df_lstm_pdf.columns:
+        before = len(df_lstm_pdf)
+        df_lstm_pdf = df_lstm_pdf.drop_duplicates(subset=["lstm_window_id"], keep="first")
+        after = len(df_lstm_pdf)
+        if after != before:
+            print(f"[14C] Deduped windows by id: {before} → {after}")
+
+    tgt_cols = [f.name for f in LSTM_WIN_SCHEMA]
+    # Ensure column presence/order
+    for c in tgt_cols:
+        if c not in df_lstm_pdf.columns:
+            df_lstm_pdf[c] = None
+    df_lstm_pdf = df_lstm_pdf[tgt_cols]
+
+    # Schemas for complex columns
+    complex_schemas = {
+        "row_hashes":      ArrayType(StringType()),
+        "per_step_errors": ArrayType(DoubleType()),
+    }
+
+    def _json(v, empty):
+        try:
+            return json.dumps(v if v is not None else empty)
+        except Exception:
+            return json.dumps(empty)
+
+    def _to_string(v):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return None
+        # timestamps will be parsed from ISO strings by Spark
+        if isinstance(v, pd.Timestamp):
+            try:
+                return v.tz_localize("UTC").isoformat()
+            except Exception:
+                try:
+                    return v.isoformat()
+                except Exception:
+                    return str(v)
+        return str(v)
+
+    # String-stage every column (avoid Spark pandas inference traps)
+    df_str = pd.DataFrame()
+    for c in tgt_cols:
+        if c in complex_schemas:
+            df_str[c] = df_lstm_pdf[c].apply(lambda v: _json(v, []))
+        else:
+            df_str[c] = df_lstm_pdf[c].apply(_to_string)
+
+    # Create Spark DF with ALL-STRING schema (no inference)
+    string_schema = StructType([StructField(c, StringType(), True) for c in tgt_cols])
+    tmp_df = spark.createDataFrame(df_str, schema=string_schema)
+    print("[14C] tmp_df created with all-string schema.")
+
+    # Parse/cast to target schema by NAME
+    def _is_simple(dt):
+        return isinstance(dt, (StringType, TimestampType, DoubleType))
+
+    select_exprs = []
+    for f in LSTM_WIN_SCHEMA:
+        c = f.name
+        col = F.col(f"`{c}`")
+        if c in complex_schemas:
+            col = F.from_json(col, complex_schemas[c])
+        elif isinstance(f.dataType, TimestampType):
+            col = col.cast(TimestampType())
+        elif _is_simple(f.dataType):
+            col = col.cast(f.dataType)
+        else:
+            # e.g., date is StringType in your schema; will be caught by _is_simple
+            col = col.cast(f.dataType)
+        select_exprs.append(col.alias(c))
+
+    lstm_df = tmp_df.select(*select_exprs)
+    # Touch a tiny action to confirm the plan materializes
+    _probe = lstm_df.limit(1).toPandas()
+    print(f"[14C] Parsed schema OK. Sample rows: {len(_probe)}")
+
+    # Windows file-handle hygiene: write as a single file batch to reduce churn
+    (lstm_df
+        .coalesce(1)
+        .write.format("delta")
+        .mode("append")
+        .save(str(LSTM_WIN_DELTA)))
+
+    written = lstm_df.count()
+    print(f"[14C] LSTM windows appended. rows={written}")
+
+cell 17:
+# 14D — Robust writer for engine_module_alerts (string-stage → cast) — FIXED for booleans
+import json, numpy as np, pandas as pd
+from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    StringType, BooleanType, TimestampType, IntegerType, DoubleType, DateType,
+    MapType, ArrayType
+)
+
+if len(alerts_pdf) == 0:
+    print("[14D] No alerts to write.")
+else:
+    tgt_cols = [f.name for f in ALERTS_SCHEMA]
+    for c in tgt_cols:
+        if c not in alerts_pdf.columns:
+            alerts_pdf[c] = None
+    alerts_pdf = alerts_pdf[tgt_cols]
+
+    complex_schemas = {
+        "triggering_models": ArrayType(StringType()),
+        "top_features":      ArrayType(StringType()),
+        "model_versions":    MapType(StringType(), StringType()),
+        "notified_channels": ArrayType(StringType()),
+        "linked_rows":       ArrayType(StringType()),
+        "extra":             MapType(StringType(), StringType()),
+    }
+
+    def _json(v, empty):
+        try: return json.dumps(v if v is not None else empty)
+        except Exception: return json.dumps(empty)
+
+    def _to_string(v):
+        # normalize nulls
+        if v is None or (isinstance(v, float) and np.isnan(v)): 
+            return None
+        # booleans must be lowercase strings for Spark->Boolean cast
+        if isinstance(v, (bool, np.bool_)):
+            return "true" if bool(v) else "false"
+        # timestamps -> ISO
+        if isinstance(v, pd.Timestamp):
+            try: return v.tz_localize("UTC").isoformat()
+            except Exception: return v.isoformat()
+        return str(v)
+
+    # string-stage all columns
+    df_str = pd.DataFrame()
+    for c in tgt_cols:
+        if c in complex_schemas:
+            empty = [] if isinstance(complex_schemas[c], ArrayType) else {}
+            df_str[c] = alerts_pdf[c].apply(lambda v: _json(v, empty))
+        else:
+            df_str[c] = alerts_pdf[c].apply(_to_string)
+
+    from pyspark.sql.types import StructType, StructField
+    string_schema = StructType([StructField(c, StringType(), True) for c in tgt_cols])
+    tmp_df = spark.createDataFrame(df_str, schema=string_schema)
+
+    # include BooleanType here
+    def _is_simple(dt):
+        return isinstance(dt, (StringType, BooleanType, TimestampType, IntegerType, DoubleType, DateType))
+
+    select_exprs = []
+    for f in ALERTS_SCHEMA:
+        c = f.name
+        col = F.col(f"`{c}`")
+        if c in complex_schemas:
+            col = F.from_json(col, complex_schemas[c])
+        elif isinstance(f.dataType, TimestampType):
+            col = col.cast(TimestampType())
+        elif isinstance(f.dataType, DateType):
+            col = col.cast(DateType())
+        elif isinstance(f.dataType, BooleanType):
+            # strings "true"/"false" -> boolean
+            col = F.when(F.lower(col) == F.lit("true"), F.lit(True)) \
+                   .when(F.lower(col) == F.lit("false"), F.lit(False)) \
+                   .otherwise(None).cast(BooleanType())
+        elif _is_simple(f.dataType):
+            col = col.cast(f.dataType)
+        select_exprs.append(col.alias(c))
+
+    alerts_df = tmp_df.select(*select_exprs)
+    alerts_df.write.format("delta").mode("append").save(str(ALERTS_DELTA))
+    print(f"[14D] Alerts appended: {alerts_df.count()} rows")
+cell 20:
+# 14E — Robust writer for engine_module_model_metadata (string-stage → cast)
+import json
+from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    StringType, TimestampType, DateType,
+    MapType
+)
+
+if len(meta_pdf) == 0:
+    print("[14E] No metadata to write.")
+else:
+    tgt_cols = [f.name for f in MODEL_METADATA_SCHEMA]
+    for c in tgt_cols:
+        if c not in meta_pdf.columns:
+            meta_pdf[c] = None
+    meta_pdf = meta_pdf[tgt_cols]
+
+    complex_schemas = {
+        "model_versions": MapType(StringType(), StringType()),
+        "params":         MapType(StringType(), StringType()),
+        "baseline_stats": MapType(StringType(), StringType()),
+    }
+
+    def _json(v, empty):
+        try: return json.dumps(v if v is not None else empty)
+        except Exception: return json.dumps(empty)
+
+    def _to_string(v):
+        if v is None or (isinstance(v, float) and np.isnan(v)): return None
+        if isinstance(v, pd.Timestamp):
+            try: return v.tz_localize("UTC").isoformat()
+            except Exception: return v.isoformat()
+        return str(v)
+
+    df_str = pd.DataFrame()
+    for c in tgt_cols:
+        if c in complex_schemas:
+            df_str[c] = meta_pdf[c].apply(lambda v: _json(v, {}))
+        else:
+            df_str[c] = meta_pdf[c].apply(_to_string)
+
+    from pyspark.sql.types import StructType, StructField, StringType
+    string_schema = StructType([StructField(c, StringType(), True) for c in tgt_cols])
+    tmp_df = spark.createDataFrame(df_str, schema=string_schema)
+
+    def _is_simple(dt):
+        return isinstance(dt, (StringType, TimestampType, DateType))
+
+    select_exprs = []
+    for f in MODEL_METADATA_SCHEMA:
+        c = f.name
+        col = F.col(f"`{c}`")
+        if c in complex_schemas:
+            col = F.from_json(col, complex_schemas[c])
+        elif isinstance(f.dataType, TimestampType):
+            col = col.cast(TimestampType())
+        elif isinstance(f.dataType, DateType):
+            col = col.cast(DateType())
+        elif _is_simple(f.dataType):
+            col = col.cast(f.dataType)
+        select_exprs.append(col.alias(c))
+
+    meta_df = tmp_df.select(*select_exprs)
+    meta_df.write.format("delta").mode("append").save(str(MODEL_META_DELTA))
+    print(f"[14E] Model metadata appended: {meta_df.count()} rows")
+cell 21:
+# 14F — Robust writer for vehicle_health_summary (string-stage → cast + MERGE)
+import json
+from delta.tables import DeltaTable
+from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    StringType, IntegerType, DoubleType, TimestampType, DateType,
+    MapType, ArrayType
+)
+
+if len(veh_pdf) == 0:
+    print("[14F] No vehicle health rows to write.")
+else:
+    tgt_cols = [f.name for f in VEH_HEALTH_SCHEMA]
+    for c in tgt_cols:
+        if c not in veh_pdf.columns:
+            veh_pdf[c] = None
+    veh_pdf = veh_pdf[tgt_cols]
+
+    complex_schemas = {
+        "top_failure_modes": ArrayType(StringType()),
+        "model_versions":    MapType(StringType(), StringType()),
+    }
+
+    def _json(v, empty):
+        try: return json.dumps(v if v is not None else empty)
+        except Exception: return json.dumps(empty)
+
+    def _to_string(v):
+        if v is None or (isinstance(v, float) and np.isnan(v)): return None
+        if isinstance(v, pd.Timestamp):
+            try: return v.tz_localize("UTC").isoformat()
+            except Exception: return v.isoformat()
+        return str(v)
+
+    df_str = pd.DataFrame()
+    for c in tgt_cols:
+        if c in complex_schemas:
+            empty = [] if isinstance(complex_schemas[c], ArrayType) else {}
+            df_str[c] = veh_pdf[c].apply(lambda v: _json(v, empty))
+        else:
+            df_str[c] = veh_pdf[c].apply(_to_string)
+
+    from pyspark.sql.types import StructType, StructField, StringType
+    string_schema = StructType([StructField(c, StringType(), True) for c in tgt_cols])
+    tmp_df = spark.createDataFrame(df_str, schema=string_schema)
+
+    def _is_simple(dt):
+        return isinstance(dt, (StringType, IntegerType, DoubleType, TimestampType, DateType))
+
+    select_exprs = []
+    for f in VEH_HEALTH_SCHEMA:
+        c = f.name
+        col = F.col(f"`{c}`")
+        if c in complex_schemas:
+            col = F.from_json(col, complex_schemas[c])
+        elif isinstance(f.dataType, (TimestampType, DateType)):
+            col = col.cast(f.dataType)
+        elif _is_simple(f.dataType):
+            col = col.cast(f.dataType)
+        select_exprs.append(col.alias(c))
+
+    veh_df = tmp_df.select(*select_exprs)
+
+    tgt_h = DeltaTable.forPath(spark, str(VEH_HEALTH_DELTA))
+    (tgt_h.alias("t")
+         .merge(veh_df.alias("s"),
+                "t.vehicle_id = s.vehicle_id AND t.date = s.date")
+         .whenMatchedUpdate(
+             condition="s.last_inference_ts > t.last_inference_ts",
+             set={c: f"s.`{c}`" for c in veh_df.columns}
+          )
+         .whenNotMatchedInsert(values={c: f"s.`{c}`" for c in veh_df.columns})
+         .execute())
+    print(f"[14F] Vehicle health MERGE complete: {veh_df.count()} rows")
+
+Now this notebook is working and messy with conflicting cells look like note sure.
+So do the following things:
+1. Refine the notebook with minimal changes.
+2. We write the 5 output tables but now we will write only 1 table inference result as planned because rest four are derived from inference table and do not require to infer with models. So, that can be done later stage.
+3. Now make minimal changes in this notebook to infer with our new model files in new artifacts folders. C:\engine_module_pipeline\infer_stage\artifacts
+4. Look for the new cols names and order we are using. Also remember the two features col has : in col name in delta table but there respective kdd and gmm files had _COLON_.
+5. Make sure all the planned cols in inference result tables are now filled with values and are not empty. And remember to remove notice and combiner score cols which are not useful.
+6. The final requirement is all the cols in inference result tables as planned are filled and we do not get any empty cols. If present notebook does not have logic for the some cols add them. And make sure that our new models artifacts folder infer successfully.
+7. The tables are to written in new place C:\engine_module_pipeline\infer_stage\delta; also the same way checkpoints, dlq and logs.
+8. Do not change the cell which write initial structure of all 5 delta tables. Let it write it so that later stages merge work even if we are writing only inference_result tables.
+9. Do change any query or spark build code as they are only working version. Be cautious with them.
+10. Make minimal changes in notebook so that we write only inference result table only for now and works with new artifacts, new paths are updated and col names are handled and all kdd and gmm for each features work.
+11. we will not implement ML flow for now so take models locally from new artifacts and infer with them. We do add cells for ML flow so that when ML flow server is up a minimal change in cell can set model import from local to mlflow setup.
+
+
